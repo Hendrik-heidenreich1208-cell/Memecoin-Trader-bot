@@ -141,7 +141,7 @@ def estimate_spend_usd(
     return None
 
 
-@app.get("/")
+@app.get("/stats")
 async def health():
     return {
         "ok": True,
@@ -232,3 +232,4 @@ async def test_telegram():
         "â Telegram-Test erfolgreich! Dein Memecoin-Bot funktioniert."
     )
     return {"ok": True}
+
