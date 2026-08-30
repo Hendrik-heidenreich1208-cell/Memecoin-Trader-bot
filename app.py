@@ -22,6 +22,10 @@ SOLANA_EXPLORER = "https://solscan.io/tx/"
 #   "wallet_address": {"name": "Trader A", "score": 92}
 # }
 TRACKED_WALLETS: Dict[str, Dict[str, Any]] = {
+    "9jyqFiLnruggwNn4EQwBNFXwpbLM9hrA4hV59ytyAVVz": {
+        "name": "Trader 1",
+        "score": 1
+    }
     # "PASTE_SOLANA_WALLET_HERE": {"name": "Trader 1", "score": 90},
 }
 
