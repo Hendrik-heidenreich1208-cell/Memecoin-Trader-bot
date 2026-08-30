@@ -214,3 +214,9 @@ async def helius_webhook(request: Request):
             _seen[signature] = time.time()
 
     return {"ok": True, "alerts_sent": alerts}
+
+
+@app.get("/test-telegram")
+async def test_telegram():
+    await send_telegram("✅ Telegram-Test erfolgreich! Dein Memecoin-Bot funktioniert.")
+    return {"ok": True}
