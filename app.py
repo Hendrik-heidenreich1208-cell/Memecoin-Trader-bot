@@ -6,45 +6,48 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-app = FastAPI(title="Memecoin V10 Early Signal Bot")
+app = FastAPI(title="Memecoin V11 Opportunity Score Bot")
 
-BUILD_VERSION = "FIXED-2026-08-30-V10-EARLY-SIGNAL"
+BUILD_VERSION = "FIXED-2026-08-30-V12-INSTANT-BUY-ALERT"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 tracked_wallets_env = os.getenv("TRACKED_WALLETS", "")
-TRACKED_WALLETS: Dict[str, Dict[str, Any]] = {}
+TRACKED_WALLETS = {
+    w.strip()
+    for w in tracked_wallets_env.split(",")
+    if w.strip()
+}
 
-for i, wallet in enumerate(tracked_wallets_env.split(","), start=1):
-    wallet = wallet.strip()
-    if wallet:
-        TRACKED_WALLETS[wallet] = {"name": f"Trader {i}"}
+# ------------------------------------------------------------
+# V11: ONE STRONG TRADER IS ENOUGH
+# The 15 tracked wallets are treated as curated strong traders.
+# A signal is sent only when the market score is high enough.
+# ------------------------------------------------------------
 
-TRADER_WINDOW_MINUTES = int(os.getenv("TRADER_WINDOW_MINUTES", "15"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "72"))
 
-# Early signal: 1 tracked trader + strong momentum
-EARLY_MIN_LIQUIDITY_USD = float(os.getenv("EARLY_MIN_LIQUIDITY_USD", "40000"))
-EARLY_MIN_VOLUME_M5_USD = float(os.getenv("EARLY_MIN_VOLUME_M5_USD", "15000"))
-EARLY_MIN_M5_BUYS = int(os.getenv("EARLY_MIN_M5_BUYS", "8"))
-EARLY_MIN_BUY_SELL_RATIO = float(os.getenv("EARLY_MIN_BUY_SELL_RATIO", "1.4"))
-EARLY_MIN_PRICE_CHANGE_M5 = float(os.getenv("EARLY_MIN_PRICE_CHANGE_M5", "1.5"))
-EARLY_MIN_MARKET_CAP_USD = float(os.getenv("EARLY_MIN_MARKET_CAP_USD", "75000"))
-EARLY_MAX_MARKET_CAP_USD = float(os.getenv("EARLY_MAX_MARKET_CAP_USD", "8000000"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "35000"))
+MIN_VOLUME_M5_USD = float(os.getenv("MIN_VOLUME_M5_USD", "12000"))
+MIN_M5_BUYS = int(os.getenv("MIN_M5_BUYS", "7"))
+MIN_BUY_SELL_RATIO = float(os.getenv("MIN_BUY_SELL_RATIO", "1.25"))
 
-# Confirmed signal: 2+ distinct tracked traders + stricter filters
-CONFIRMED_MIN_TRADERS = int(os.getenv("CONFIRMED_MIN_TRADERS", "2"))
-CONFIRMED_MIN_LIQUIDITY_USD = float(os.getenv("CONFIRMED_MIN_LIQUIDITY_USD", "50000"))
-CONFIRMED_MIN_VOLUME_M5_USD = float(os.getenv("CONFIRMED_MIN_VOLUME_M5_USD", "20000"))
-CONFIRMED_MIN_M5_BUYS = int(os.getenv("CONFIRMED_MIN_M5_BUYS", "10"))
-CONFIRMED_MIN_BUY_SELL_RATIO = float(os.getenv("CONFIRMED_MIN_BUY_SELL_RATIO", "1.5"))
-CONFIRMED_MIN_PRICE_CHANGE_M5 = float(os.getenv("CONFIRMED_MIN_PRICE_CHANGE_M5", "3"))
-CONFIRMED_MIN_MARKET_CAP_USD = float(os.getenv("CONFIRMED_MIN_MARKET_CAP_USD", "100000"))
-CONFIRMED_MAX_MARKET_CAP_USD = float(os.getenv("CONFIRMED_MAX_MARKET_CAP_USD", "10000000"))
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "60000"))
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "12000000"))
 
-EARLY_ALERT_COOLDOWN_MINUTES = int(os.getenv("EARLY_ALERT_COOLDOWN_MINUTES", "120"))
-CONFIRMED_ALERT_COOLDOWN_MINUTES = int(os.getenv("CONFIRMED_ALERT_COOLDOWN_MINUTES", "180"))
+# Avoid entering after an extreme 5-minute pump.
+MAX_PRICE_CHANGE_M5 = float(os.getenv("MAX_PRICE_CHANGE_M5", "35"))
+
+# Prefer coins that are not literally seconds old, but still early.
+MIN_PAIR_AGE_MINUTES = float(os.getenv("MIN_PAIR_AGE_MINUTES", "2"))
+MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "72"))
+
+# Basic liquidity-vs-market-cap sanity rule.
+MAX_MC_TO_LIQ_RATIO = float(os.getenv("MAX_MC_TO_LIQ_RATIO", "80"))
+
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "120"))
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -52,10 +55,7 @@ USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 QUOTE_MINTS = {WSOL_MINT, USDC_MINT, USDT_MINT}
 
 _seen_signatures: Dict[str, float] = {}
-_buy_signals: Dict[str, List[Tuple[str, float]]] = {}
-_early_alerted_mints: Dict[str, float] = {}
-_confirmed_alerted_mints: Dict[str, float] = {}
-
+_alerted_mints: Dict[str, float] = {}
 SEEN_TTL_SECONDS = 7200
 
 STATS = {
@@ -64,11 +64,10 @@ STATS = {
     "swap_events_received": 0,
     "tracked_wallet_matches": 0,
     "real_buys_detected": 0,
-    "early_market_checks": 0,
-    "early_alerts_sent": 0,
-    "confirmed_candidates": 0,
-    "confirmed_market_checks": 0,
-    "confirmed_alerts_sent": 0,
+    "market_checks": 0,
+    "signals_sent": 0,
+    "filtered_low_score": 0,
+    "filtered_hard_rule": 0,
     "telegram_rate_limits": 0,
     "market_api_failures": 0,
     "ignored_non_swap": 0,
@@ -76,7 +75,8 @@ STATS = {
     "last_trader": None,
     "last_signature": None,
     "last_buy_mint": None,
-    "last_signal_level": None,
+    "last_score": None,
+    "last_grade": None,
     "last_filter_reason": None,
     "last_market_data": None,
     "last_error": None,
@@ -116,23 +116,10 @@ def cleanup_state() -> None:
         if now - ts > SEEN_TTL_SECONDS:
             _seen_signatures.pop(signature, None)
 
-    window_seconds = TRADER_WINDOW_MINUTES * 60
-    for mint, signals in list(_buy_signals.items()):
-        recent = [(wallet, ts) for wallet, ts in signals if now - ts <= window_seconds]
-        if recent:
-            _buy_signals[mint] = recent
-        else:
-            _buy_signals.pop(mint, None)
-
-    early_cd = EARLY_ALERT_COOLDOWN_MINUTES * 60
-    for mint, ts in list(_early_alerted_mints.items()):
-        if now - ts > early_cd:
-            _early_alerted_mints.pop(mint, None)
-
-    confirmed_cd = CONFIRMED_ALERT_COOLDOWN_MINUTES * 60
-    for mint, ts in list(_confirmed_alerted_mints.items()):
-        if now - ts > confirmed_cd:
-            _confirmed_alerted_mints.pop(mint, None)
+    cooldown = ALERT_COOLDOWN_MINUTES * 60
+    for mint, ts in list(_alerted_mints.items()):
+        if now - ts > cooldown:
+            _alerted_mints.pop(mint, None)
 
 
 def normalize_events(payload: Any) -> List[Dict[str, Any]]:
@@ -162,14 +149,12 @@ def walk(obj: Any):
 
 
 def find_tracked_wallet(event: Dict[str, Any]) -> Optional[str]:
-    tracked = set(TRACKED_WALLETS.keys())
-
     fee_payer = event.get("feePayer")
-    if fee_payer in tracked:
+    if fee_payer in TRACKED_WALLETS:
         return fee_payer
 
     for node in walk(event):
-        if isinstance(node, str) and node in tracked:
+        if isinstance(node, str) and node in TRACKED_WALLETS:
             return node
 
     return None
@@ -344,19 +329,6 @@ def detect_real_buy(
     return detect_buy_from_transfers(event, trader_wallet)
 
 
-def register_buy_signal(mint: str, trader_wallet: str) -> int:
-    now = time.time()
-    window_seconds = TRADER_WINDOW_MINUTES * 60
-    signals = _buy_signals.setdefault(mint, [])
-
-    signals[:] = [(wallet, ts) for wallet, ts in signals if now - ts <= window_seconds]
-
-    if not any(wallet == trader_wallet for wallet, _ in signals):
-        signals.append((trader_wallet, now))
-
-    return len({wallet for wallet, _ in signals})
-
-
 async def fetch_market_data(mint: str) -> Optional[Dict[str, Any]]:
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
 
@@ -393,6 +365,11 @@ async def fetch_market_data(mint: str) -> Optional[Dict[str, Any]]:
         if market_cap <= 0:
             market_cap = safe_float(pair.get("fdv"))
 
+        created_ms = safe_float(pair.get("pairCreatedAt"))
+        age_minutes = 0.0
+        if created_ms > 0:
+            age_minutes = max(0.0, (time.time() - created_ms / 1000) / 60)
+
         base_token = pair.get("baseToken") or {}
 
         return {
@@ -404,6 +381,7 @@ async def fetch_market_data(mint: str) -> Optional[Dict[str, Any]]:
             "sells_m5": int(safe_float(txns_m5.get("sells"))),
             "price_change_m5": safe_float((pair.get("priceChange") or {}).get("m5")),
             "market_cap_usd": market_cap,
+            "pair_age_minutes": age_minutes,
             "dex": pair.get("dexId") or "?",
         }
 
@@ -413,63 +391,222 @@ async def fetch_market_data(mint: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def evaluate_early(market: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+def hard_filter(market: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     if not market:
         return False, "Keine Marktdaten"
 
+    liquidity = market["liquidity_usd"]
+    volume = market["volume_m5_usd"]
     buys = market["buys_m5"]
     sells = market["sells_m5"]
     ratio = buys / max(sells, 1)
+    mc = market["market_cap_usd"]
+    age_min = market["pair_age_minutes"]
+    change = market["price_change_m5"]
 
-    if market["liquidity_usd"] < EARLY_MIN_LIQUIDITY_USD:
-        return False, "Early: LiquiditÃ¤t zu niedrig"
-    if market["volume_m5_usd"] < EARLY_MIN_VOLUME_M5_USD:
-        return False, "Early: Volumen zu niedrig"
-    if buys < EARLY_MIN_M5_BUYS:
-        return False, "Early: zu wenige KÃ¤ufe"
-    if ratio < EARLY_MIN_BUY_SELL_RATIO:
-        return False, "Early: Kaufdruck zu schwach"
-    if market["price_change_m5"] < EARLY_MIN_PRICE_CHANGE_M5:
-        return False, "Early: Momentum zu schwach"
-    if market["market_cap_usd"] < EARLY_MIN_MARKET_CAP_USD:
-        return False, "Early: Market Cap zu klein"
-    if market["market_cap_usd"] > EARLY_MAX_MARKET_CAP_USD:
-        return False, "Early: Market Cap zu groÃ"
+    if liquidity < MIN_LIQUIDITY_USD:
+        return False, f"LiquiditÃ¤t zu niedrig (${liquidity:,.0f})"
+    if volume < MIN_VOLUME_M5_USD:
+        return False, f"5m-Volumen zu niedrig (${volume:,.0f})"
+    if buys < MIN_M5_BUYS:
+        return False, f"Zu wenige KÃ¤ufe ({buys})"
+    if ratio < MIN_BUY_SELL_RATIO:
+        return False, f"Buy/Sell zu schwach ({ratio:.2f}x)"
+    if mc <= 0:
+        return False, "Market Cap unbekannt"
+    if mc < MIN_MARKET_CAP_USD:
+        return False, f"Market Cap zu klein (${mc:,.0f})"
+    if mc > MAX_MARKET_CAP_USD:
+        return False, f"Market Cap zu groÃ (${mc:,.0f})"
+    if change > MAX_PRICE_CHANGE_M5:
+        return False, f"Schon zu stark gepumpt (+{change:.1f}% / 5m)"
+    if age_min > 0 and age_min < MIN_PAIR_AGE_MINUTES:
+        return False, f"Pair extrem neu ({age_min:.1f} Min.)"
+    if age_min > MAX_PAIR_AGE_HOURS * 60:
+        return False, f"Pair zu alt ({age_min/60:.1f} Std.)"
+    if liquidity > 0 and mc / liquidity > MAX_MC_TO_LIQ_RATIO:
+        return False, f"MarketCap/LiquiditÃ¤t zu hoch ({mc/liquidity:.1f}x)"
 
-    return True, "EARLY PASS"
+    return True, "PASS"
 
 
-def evaluate_confirmed(market: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
-    if not market:
-        return False, "Keine Marktdaten"
+def calculate_score(market: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    0-100 Opportunity Score.
+    One tracked strong trader is already the trigger.
+    Market structure decides whether the alert is good enough.
+    """
+    score = 30  # strong tracked trader signal
 
+    liquidity = market["liquidity_usd"]
+    volume = market["volume_m5_usd"]
     buys = market["buys_m5"]
     sells = market["sells_m5"]
     ratio = buys / max(sells, 1)
+    change = market["price_change_m5"]
+    mc = market["market_cap_usd"]
+    age_min = market["pair_age_minutes"]
 
-    if market["liquidity_usd"] < CONFIRMED_MIN_LIQUIDITY_USD:
-        return False, "Confirmed: LiquiditÃ¤t zu niedrig"
-    if market["volume_m5_usd"] < CONFIRMED_MIN_VOLUME_M5_USD:
-        return False, "Confirmed: Volumen zu niedrig"
-    if buys < CONFIRMED_MIN_M5_BUYS:
-        return False, "Confirmed: zu wenige KÃ¤ufe"
-    if ratio < CONFIRMED_MIN_BUY_SELL_RATIO:
-        return False, "Confirmed: Kaufdruck zu schwach"
-    if market["price_change_m5"] < CONFIRMED_MIN_PRICE_CHANGE_M5:
-        return False, "Confirmed: Momentum zu schwach"
-    if market["market_cap_usd"] < CONFIRMED_MIN_MARKET_CAP_USD:
-        return False, "Confirmed: Market Cap zu klein"
-    if market["market_cap_usd"] > CONFIRMED_MAX_MARKET_CAP_USD:
-        return False, "Confirmed: Market Cap zu groÃ"
+    # Liquidity: max +18
+    if liquidity >= 150000:
+        score += 18
+    elif liquidity >= 80000:
+        score += 15
+    elif liquidity >= 50000:
+        score += 12
+    else:
+        score += 8
 
-    return True, "CONFIRMED PASS"
+    # 5m volume: max +14
+    if volume >= 100000:
+        score += 14
+    elif volume >= 50000:
+        score += 12
+    elif volume >= 25000:
+        score += 9
+    else:
+        score += 6
+
+    # Buy pressure: max +14
+    if ratio >= 3.0:
+        score += 14
+    elif ratio >= 2.0:
+        score += 11
+    elif ratio >= 1.5:
+        score += 8
+    else:
+        score += 5
+
+    # Momentum sweet spot: max +12
+    # We reward positive movement, but not a huge chase.
+    if 3 <= change <= 15:
+        score += 12
+    elif 1 <= change < 3:
+        score += 9
+    elif 15 < change <= 25:
+        score += 7
+    elif 25 < change <= MAX_PRICE_CHANGE_M5:
+        score += 3
+    elif change < 0:
+        score += 1
+
+    # Market cap: max +6
+    if 100000 <= mc <= 3000000:
+        score += 6
+    elif 60000 <= mc <= 6000000:
+        score += 4
+    else:
+        score += 2
+
+    # Pair age: max +6
+    if 5 <= age_min <= 360:
+        score += 6
+    elif 2 <= age_min < 5:
+        score += 4
+    elif 360 < age_min <= 1440:
+        score += 3
+    elif age_min == 0:
+        score += 2
+
+    score = min(score, 100)
+
+    if score >= 88:
+        grade = "ð¥ VERY STRONG"
+    elif score >= 80:
+        grade = "ð STRONG"
+    elif score >= MIN_SCORE:
+        grade = "â¡ EARLY GOOD"
+    else:
+        grade = "WATCH"
+
+    return score, grade
+
+
+async def send_instant_buy_alert(
+    mint: str,
+    trader_wallet: str,
+) -> bool:
+    """
+    V12 core behavior:
+    As soon as a real BUY by any tracked wallet is detected,
+    send Telegram immediately. No DexScreener request first.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        STATS["last_error"] = "Telegram-Konfiguration fehlt."
+        return False
+
+    short_wallet = (
+        f"{trader_wallet[:5]}...{trader_wallet[-5:]}"
+        if len(trader_wallet) > 12
+        else trader_wallet
+    )
+
+    message = (
+        "ð¨ INSTANT BUY ALERT\n\n"
+        "ð¤ Einer deiner beobachteten Trader hat gerade gekauft.\n"
+        f"ð Wallet: {short_wallet}\n\n"
+        "ðª CONTRACT ADDRESS (CA):\n"
+        f"{mint}\n\n"
+        "ð Unten auf âCA kopierenâ tippen und in Phantom prÃ¼fen.\n\n"
+        "â ï¸ Das ist eine KaufaktivitÃ¤ts-Meldung, keine Gewinnprognose. "
+        "CA, LiquiditÃ¤t, Preis und Slippage vor einem Kauf selbst prÃ¼fen."
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[{
+                "text": "ð CA kopieren",
+                "copy_text": {"text": mint},
+            }]]
+        },
+    }
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        for attempt in range(2):
+            try:
+                response = await client.post(url, json=payload)
+            except Exception as exc:
+                STATS["last_error"] = f"Telegram network error: {str(exc)[:200]}"
+                return False
+
+            if response.status_code == 429:
+                STATS["telegram_rate_limits"] += 1
+                try:
+                    retry_after = int(
+                        response.json().get("parameters", {}).get("retry_after", 2)
+                    )
+                except Exception:
+                    retry_after = 2
+
+                if attempt == 0:
+                    await asyncio.sleep(min(max(retry_after, 1), 5))
+                    continue
+
+                STATS["last_error"] = "Telegram 429 Too Many Requests"
+                return False
+
+            if response.is_error:
+                STATS["last_error"] = (
+                    f"Telegram HTTP {response.status_code}: {response.text[:200]}"
+                )
+                return False
+
+            STATS["last_error"] = None
+            return True
+
+    return False
 
 
 async def send_telegram_signal(
-    level: str,
     mint: str,
-    trader_count: int,
     market: Dict[str, Any],
+    score: int,
+    grade: str,
 ) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         STATS["last_error"] = "Telegram-Konfiguration fehlt."
@@ -478,25 +615,20 @@ async def send_telegram_signal(
     buys = market["buys_m5"]
     sells = market["sells_m5"]
     ratio = buys / max(sells, 1)
+    age_min = market["pair_age_minutes"]
 
-    if level == "EARLY":
-        headline = "â¡ EARLY SIGNAL"
-        explanation = (
-            "1 beobachteter Trader hat gekauft + Markt-Momentum ist stark.\n"
-            "â ï¸ FrÃ¼hwarnung: noch nicht durch einen zweiten Trader bestÃ¤tigt."
-        )
-    else:
-        headline = "ð CONFIRMED HIGH-POTENTIAL"
-        explanation = (
-            f"{trader_count} verschiedene beobachtete Trader haben "
-            f"innerhalb von {TRADER_WINDOW_MINUTES} Min. gekauft."
-        )
+    age_text = (
+        f"{age_min:.0f} Min."
+        if age_min < 120
+        else f"{age_min/60:.1f} Std."
+    )
 
     message = (
-        f"{headline}\n\n"
+        f"{grade} â {score}/100\n\n"
+        "ð¤ 1 starker beobachteter Trader hat gekauft\n"
+        "â Kein Warten auf einen zweiten Trader\n\n"
         f"ðª {market['name']} ({market['symbol']})\n"
-        f"ð¥ Trader-Signale: {trader_count}\n"
-        f"{explanation}\n\n"
+        f"â± Pair-Alter: {age_text}\n"
         f"ð§ LiquiditÃ¤t: ${market['liquidity_usd']:,.0f}\n"
         f"ð¥ Volumen 5m: ${market['volume_m5_usd']:,.0f}\n"
         f"ð¢ KÃ¤ufe 5m: {buys}\n"
@@ -507,9 +639,8 @@ async def send_telegram_signal(
         f"ð¦ DEX: {market['dex']}\n\n"
         "ðª CONTRACT ADDRESS (CA):\n"
         f"{mint}\n\n"
-        "ð Unten auf âCA kopierenâ tippen und in Phantom prÃ¼fen.\n\n"
-        "â ï¸ Kein Gewinn ist garantiert. CA, LiquiditÃ¤t, Preis und Slippage "
-        "vor einem Kauf selbst prÃ¼fen."
+        "â ï¸ Score ist nur ein Filter, keine Gewinnprognose. "
+        "CA, LiquiditÃ¤t und Slippage vor einem Kauf prÃ¼fen."
     )
 
     payload = {
@@ -570,7 +701,8 @@ async def health():
         "version": BUILD_VERSION,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "tracked_wallets": len(TRACKED_WALLETS),
-        "mode": "SWAP_BUY_ONLY_EARLY_PLUS_CONFIRMED",
+        "mode": "INSTANT_BUY_ALERT",
+        "min_score": MIN_SCORE,
     }
 
 
@@ -580,10 +712,18 @@ async def stats():
         "version": BUILD_VERSION,
         **STATS,
         "tracked_wallets": len(TRACKED_WALLETS),
-        "strategy": {
-            "trader_window_minutes": TRADER_WINDOW_MINUTES,
-            "early_traders": 1,
-            "confirmed_min_traders": CONFIRMED_MIN_TRADERS,
+        "filters": {
+            "min_score": MIN_SCORE,
+            "min_liquidity_usd": MIN_LIQUIDITY_USD,
+            "min_volume_m5_usd": MIN_VOLUME_M5_USD,
+            "min_m5_buys": MIN_M5_BUYS,
+            "min_buy_sell_ratio": MIN_BUY_SELL_RATIO,
+            "min_market_cap_usd": MIN_MARKET_CAP_USD,
+            "max_market_cap_usd": MAX_MARKET_CAP_USD,
+            "max_price_change_m5": MAX_PRICE_CHANGE_M5,
+            "min_pair_age_minutes": MIN_PAIR_AGE_MINUTES,
+            "max_pair_age_hours": MAX_PAIR_AGE_HOURS,
+            "max_mc_to_liq_ratio": MAX_MC_TO_LIQ_RATIO,
         },
     }
 
@@ -597,9 +737,9 @@ async def test_telegram():
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": (
-            "â V10 EARLY SIGNAL ist aktiv.\n"
-            "â¡ Early nach 1 Trader + starken Marktdaten\n"
-            "ð Confirmed nach 2+ verschiedenen Tradern"
+            "â V12 INSTANT BUY ALERT ist aktiv.\n"
+            "ð¨ Jeder erkannte Kauf eines Ã¼berwachten Traders lÃ¶st sofort einen Alarm aus.\n"
+            "ð CA-Kopierbutton ist aktiv."
         ),
     }
 
@@ -665,52 +805,21 @@ async def helius_webhook(request: Request):
             STATS["real_buys_detected"] += 1
             STATS["last_buy_mint"] = mint
 
-            trader_count = register_buy_signal(mint, trader_wallet)
+            # V12: INSTANT alert. No second trader, score or market filter can block it.
+            # We deliberately send before calling any external market-data API.
+            if mint in _alerted_mints:
+                continue
 
-            if trader_count == 1 and mint not in _early_alerted_mints:
-                STATS["early_market_checks"] += 1
-                market = await fetch_market_data(mint)
-                STATS["last_market_data"] = market
+            sent = await send_instant_buy_alert(
+                mint=mint,
+                trader_wallet=trader_wallet,
+            )
 
-                passed, reason = evaluate_early(market)
-                STATS["last_filter_reason"] = reason
-
-                if passed and market:
-                    sent = await send_telegram_signal(
-                        level="EARLY",
-                        mint=mint,
-                        trader_count=1,
-                        market=market,
-                    )
-                    if sent:
-                        _early_alerted_mints[mint] = time.time()
-                        STATS["early_alerts_sent"] += 1
-                        STATS["last_signal_level"] = "EARLY"
-                        alerts_sent += 1
-
-            if trader_count >= CONFIRMED_MIN_TRADERS:
-                STATS["confirmed_candidates"] += 1
-
-                if mint not in _confirmed_alerted_mints:
-                    STATS["confirmed_market_checks"] += 1
-                    market = await fetch_market_data(mint)
-                    STATS["last_market_data"] = market
-
-                    passed, reason = evaluate_confirmed(market)
-                    STATS["last_filter_reason"] = reason
-
-                    if passed and market:
-                        sent = await send_telegram_signal(
-                            level="CONFIRMED",
-                            mint=mint,
-                            trader_count=trader_count,
-                            market=market,
-                        )
-                        if sent:
-                            _confirmed_alerted_mints[mint] = time.time()
-                            STATS["confirmed_alerts_sent"] += 1
-                            STATS["last_signal_level"] = "CONFIRMED"
-                            alerts_sent += 1
+            if sent:
+                _alerted_mints[mint] = time.time()
+                STATS["signals_sent"] += 1
+                STATS["last_filter_reason"] = "INSTANT BUY ALERT SENT"
+                alerts_sent += 1
 
         return {
             "ok": True,
