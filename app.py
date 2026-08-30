@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 app = FastAPI(title="Memecoin Wallet Alert Bot")
 
-BUILD_VERSION = "FIXED-2026-08-30-V5"
+BUILD_VERSION = "FIXED-2026-08-30-V7-COPY-CA"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -45,7 +45,10 @@ STATS = {
 }
 
 
-async def send_telegram(message: str) -> None:
+async def send_telegram(
+    message: str,
+    copy_text: Optional[str] = None,
+) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Telegram-Konfiguration fehlt.")
 
@@ -55,6 +58,20 @@ async def send_telegram(message: str) -> None:
         "text": message,
         "disable_web_page_preview": True,
     }
+
+    if copy_text:
+        payload["reply_markup"] = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "ð CA kopieren",
+                        "copy_text": {
+                            "text": copy_text
+                        },
+                    }
+                ]
+            ]
+        }
 
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(url, json=payload)
@@ -275,37 +292,25 @@ async def helius_webhook(request: Request):
 
             trader_name = TRACKED_WALLETS[trader_wallet]["name"]
 
+            # Only alert when we can identify a token mint/contract address.
+            # The Telegram message intentionally contains the raw CA only,
+            # so it can be copied directly into Phantom.
+            if not mint:
+                continue
+
+            STATS["token_mints_found"] += 1
+
             message = (
-                "ð¨ WALLET-AKTIVITÃT ERKANNT\n\n"
+                "ð¨ MEMECOIN / TOKEN ERKANNT\n\n"
                 f"Trader: {trader_name}\n"
-                f"Wallet: {trader_wallet}\n"
-                f"Typ: {tx_type}\n\n"
-                f"{description}\n"
+                f"Wallet: {trader_wallet}\n\n"
+                "ðª CONTRACT ADDRESS (CA):\n"
+                f"{mint}\n\n"
+                "ð Diese CA kannst du direkt kopieren und in Phantom suchen.\n\n"
+                "â ï¸ PrÃ¼fe vor dem Kauf, ob die CA und der Token korrekt sind."
             )
 
-            if mint:
-                STATS["token_mints_found"] += 1
-
-                token_page, swap_link = phantom_links(mint)
-
-                message += (
-                    f"\nðª Token-Mint:\n{mint}\n"
-                    f"\nð» Phantom Token:\n{token_page}\n"
-                    f"\nâ¡ Phantom Swap:\n{swap_link}\n"
-                )
-
-            if signature:
-                message += (
-                    f"\nð Solscan:\n"
-                    f"https://solscan.io/tx/{signature}\n"
-                )
-
-            message += (
-                "\nâ ï¸ PrÃ¼fe Token-Mint, LiquiditÃ¤t und Preis "
-                "immer selbst vor einem Kauf."
-            )
-
-            await send_telegram(message)
+            await send_telegram(message, copy_text=mint)
 
             STATS["alerts_sent"] += 1
             alerts_sent += 1
