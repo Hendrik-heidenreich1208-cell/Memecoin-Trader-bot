@@ -1,84 +1,60 @@
 import os
 import time
+import json
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import websockets
 from fastapi import FastAPI, Request, HTTPException
 
-app = FastAPI(title="Memecoin V11 Opportunity Score Bot")
+BUILD_VERSION = "FIXED-2026-09-01-V14-FREE-FAST-STREAM"
 
-BUILD_VERSION = "FIXED-2026-08-30-V12-INSTANT-BUY-ALERT"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_TARGET = TELEGRAM_CHANNEL_ID or TELEGRAM_CHAT_ID
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-tracked_wallets_env = os.getenv("TRACKED_WALLETS", "")
 TRACKED_WALLETS = {
     w.strip()
-    for w in tracked_wallets_env.split(",")
+    for w in os.getenv("TRACKED_WALLETS", "").split(",")
     if w.strip()
 }
-
-# ------------------------------------------------------------
-# V11: ONE STRONG TRADER IS ENOUGH
-# The 15 tracked wallets are treated as curated strong traders.
-# A signal is sent only when the market score is high enough.
-# ------------------------------------------------------------
-
-MIN_SCORE = int(os.getenv("MIN_SCORE", "72"))
-
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "35000"))
-MIN_VOLUME_M5_USD = float(os.getenv("MIN_VOLUME_M5_USD", "12000"))
-MIN_M5_BUYS = int(os.getenv("MIN_M5_BUYS", "7"))
-MIN_BUY_SELL_RATIO = float(os.getenv("MIN_BUY_SELL_RATIO", "1.25"))
-
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "60000"))
-MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "12000000"))
-
-# Avoid entering after an extreme 5-minute pump.
-MAX_PRICE_CHANGE_M5 = float(os.getenv("MAX_PRICE_CHANGE_M5", "35"))
-
-# Prefer coins that are not literally seconds old, but still early.
-MIN_PAIR_AGE_MINUTES = float(os.getenv("MIN_PAIR_AGE_MINUTES", "2"))
-MAX_PAIR_AGE_HOURS = float(os.getenv("MAX_PAIR_AGE_HOURS", "72"))
-
-# Basic liquidity-vs-market-cap sanity rule.
-MAX_MC_TO_LIQ_RATIO = float(os.getenv("MAX_MC_TO_LIQ_RATIO", "80"))
-
-ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "120"))
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 QUOTE_MINTS = {WSOL_MINT, USDC_MINT, USDT_MINT}
 
-_seen_signatures: Dict[str, float] = {}
-_alerted_mints: Dict[str, float] = {}
-SEEN_TTL_SECONDS = 7200
+# Nur echte Transaktionen deduplizieren. Gleicher Coin darf spÃ¤ter erneut alarmieren.
+SEEN_TTL_SECONDS = int(os.getenv("SEEN_TTL_SECONDS", "7200"))
+MIN_FAST_SOL_SPEND = float(os.getenv("MIN_FAST_SOL_SPEND", "0.00005"))
 
-STATS = {
+_seen_signatures: Dict[str, float] = {}
+_ws_task: Optional[asyncio.Task] = None
+
+STATS: Dict[str, Any] = {
     "webhook_requests": 0,
-    "transactions_received": 0,
-    "swap_events_received": 0,
-    "tracked_wallet_matches": 0,
-    "real_buys_detected": 0,
-    "market_checks": 0,
+    "webhook_transactions": 0,
+    "webhook_buys": 0,
+    "ws_connected": False,
+    "ws_reconnects": 0,
+    "ws_notifications": 0,
+    "ws_transactions_fetched": 0,
+    "ws_fetch_misses": 0,
+    "ws_buys": 0,
     "signals_sent": 0,
-    "filtered_low_score": 0,
-    "filtered_hard_rule": 0,
     "telegram_rate_limits": 0,
-    "market_api_failures": 0,
-    "ignored_non_swap": 0,
+    "duplicates_ignored": 0,
     "ignored_not_buy": 0,
+    "last_source": None,
     "last_trader": None,
     "last_signature": None,
     "last_buy_mint": None,
-    "last_score": None,
-    "last_grade": None,
-    "last_filter_reason": None,
-    "last_market_data": None,
     "last_error": None,
 }
 
@@ -92,50 +68,28 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def raw_token_amount(item: Dict[str, Any]) -> float:
-    raw = item.get("rawTokenAmount")
-    if isinstance(raw, dict):
-        token_amount = safe_float(raw.get("tokenAmount"))
-        decimals = int(safe_float(raw.get("decimals")))
-        try:
-            return token_amount / (10 ** decimals)
-        except Exception:
-            return token_amount
-
-    for key in ("tokenAmount", "amount", "uiAmount"):
-        if key in item:
-            return safe_float(item.get(key))
-
-    return 0.0
-
-
-def cleanup_state() -> None:
+def cleanup_seen() -> None:
     now = time.time()
-
-    for signature, ts in list(_seen_signatures.items()):
+    for sig, ts in list(_seen_signatures.items()):
         if now - ts > SEEN_TTL_SECONDS:
-            _seen_signatures.pop(signature, None)
-
-    cooldown = ALERT_COOLDOWN_MINUTES * 60
-    for mint, ts in list(_alerted_mints.items()):
-        if now - ts > cooldown:
-            _alerted_mints.pop(mint, None)
+            _seen_signatures.pop(sig, None)
 
 
-def normalize_events(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
+def claim_signature(signature: Optional[str]) -> bool:
+    if not signature:
+        return True
+    cleanup_seen()
+    if signature in _seen_signatures:
+        STATS["duplicates_ignored"] += 1
+        return False
+    _seen_signatures[signature] = time.time()
+    return True
 
-    if isinstance(payload, dict):
-        for key in ("data", "events", "transactions", "result"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [x for x in value if isinstance(x, dict)]
-            if isinstance(value, dict):
-                return [value]
-        return [payload]
 
-    return []
+def unclaim_signature(signature: Optional[str]) -> None:
+    # Wenn wir die Transaktion noch nicht lesen konnten, darf der Webhook sie spÃ¤ter Ã¼bernehmen.
+    if signature:
+        _seen_signatures.pop(signature, None)
 
 
 def walk(obj: Any):
@@ -148,15 +102,27 @@ def walk(obj: Any):
             yield from walk(value)
 
 
+def normalize_events(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "events", "transactions", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+            if isinstance(value, dict):
+                return [value]
+        return [payload]
+    return []
+
+
 def find_tracked_wallet(event: Dict[str, Any]) -> Optional[str]:
     fee_payer = event.get("feePayer")
     if fee_payer in TRACKED_WALLETS:
         return fee_payer
-
     for node in walk(event):
         if isinstance(node, str) and node in TRACKED_WALLETS:
             return node
-
     return None
 
 
@@ -164,154 +130,192 @@ def find_signature(event: Dict[str, Any]) -> Optional[str]:
     value = event.get("signature")
     if value:
         return str(value)
-
     for node in walk(event):
         if isinstance(node, dict):
             for key in ("signature", "transactionSignature", "txSignature"):
                 value = node.get(key)
                 if value:
                     return str(value)
-
     return None
 
 
 def is_swap_event(event: Dict[str, Any]) -> bool:
     if str(event.get("type", "")).upper() == "SWAP":
         return True
-
     events = event.get("events")
     return isinstance(events, dict) and isinstance(events.get("swap"), dict)
 
 
-def detect_buy_from_swap_event(
+def raw_token_amount(item: Dict[str, Any]) -> float:
+    raw = item.get("rawTokenAmount")
+    if isinstance(raw, dict):
+        token_amount = safe_float(raw.get("tokenAmount"))
+        decimals = int(safe_float(raw.get("decimals")))
+        return token_amount / (10 ** decimals) if decimals >= 0 else token_amount
+    for key in ("tokenAmount", "amount", "uiAmount"):
+        if key in item:
+            return safe_float(item.get(key))
+    return 0.0
+
+
+def detect_buy_from_enhanced_event(
     event: Dict[str, Any],
     trader_wallet: str,
 ) -> Optional[Tuple[str, float]]:
     events = event.get("events")
-    if not isinstance(events, dict):
-        return None
+    if isinstance(events, dict) and isinstance(events.get("swap"), dict):
+        swap = events["swap"]
+        quote_spent = False
 
-    swap = events.get("swap")
-    if not isinstance(swap, dict):
-        return None
+        native_input = swap.get("nativeInput") or {}
+        if (
+            isinstance(native_input, dict)
+            and native_input.get("account") == trader_wallet
+            and safe_float(native_input.get("amount")) > 0
+        ):
+            quote_spent = True
 
-    token_inputs = swap.get("tokenInputs") or []
-    token_outputs = swap.get("tokenOutputs") or []
-    native_input = swap.get("nativeInput") or {}
+        for item in swap.get("tokenInputs") or []:
+            if (
+                isinstance(item, dict)
+                and item.get("userAccount") == trader_wallet
+                and item.get("mint") in QUOTE_MINTS
+            ):
+                quote_spent = True
 
+        outputs: List[Tuple[str, float]] = []
+        for item in swap.get("tokenOutputs") or []:
+            if not isinstance(item, dict):
+                continue
+            mint = item.get("mint")
+            if (
+                item.get("userAccount") == trader_wallet
+                and mint
+                and mint not in QUOTE_MINTS
+            ):
+                outputs.append((str(mint), raw_token_amount(item)))
+
+        if quote_spent and outputs:
+            outputs.sort(key=lambda x: x[1], reverse=True)
+            return outputs[0]
+
+    # Fallback auf Enhanced Transfers
+    net: Dict[str, float] = {}
     quote_spent = False
 
-    if isinstance(native_input, dict) and native_input.get("account") == trader_wallet:
-        if safe_float(native_input.get("amount")) > 0:
+    for tr in event.get("tokenTransfers") or []:
+        if not isinstance(tr, dict):
+            continue
+        mint = tr.get("mint") or tr.get("tokenMint") or tr.get("mintAddress")
+        if not mint:
+            continue
+        amount = safe_float(tr.get("tokenAmount") or tr.get("amount"))
+        src = tr.get("fromUserAccount") or tr.get("from")
+        dst = tr.get("toUserAccount") or tr.get("to")
+        if dst == trader_wallet:
+            net[str(mint)] = net.get(str(mint), 0.0) + amount
+        if src == trader_wallet:
+            net[str(mint)] = net.get(str(mint), 0.0) - amount
+            if mint in QUOTE_MINTS:
+                quote_spent = True
+
+    for tr in event.get("nativeTransfers") or []:
+        if not isinstance(tr, dict):
+            continue
+        src = tr.get("fromUserAccount") or tr.get("from")
+        if src == trader_wallet and safe_float(tr.get("amount")) > 0:
             quote_spent = True
+            break
 
-    for item in token_inputs:
-        if not isinstance(item, dict):
-            continue
-        if item.get("userAccount") == trader_wallet and item.get("mint") in QUOTE_MINTS:
-            quote_spent = True
-
-    outputs: List[Tuple[str, float]] = []
-
-    for item in token_outputs:
-        if not isinstance(item, dict):
-            continue
-        if item.get("userAccount") != trader_wallet:
-            continue
-
-        mint = item.get("mint")
-        if not mint or mint in QUOTE_MINTS:
-            continue
-
-        outputs.append((str(mint), raw_token_amount(item)))
-
-    if quote_spent and outputs:
-        outputs.sort(key=lambda x: x[1], reverse=True)
-        return outputs[0]
+    if quote_spent:
+        candidates = [
+            (mint, amount)
+            for mint, amount in net.items()
+            if mint not in QUOTE_MINTS and amount > 0
+        ]
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[0]
 
     return None
 
 
-def transfer_token_amount(transfer: Dict[str, Any]) -> float:
-    value = transfer.get("tokenAmount")
-    if isinstance(value, (int, float, str)):
-        return safe_float(value)
-
-    if isinstance(value, dict):
-        for key in ("uiAmount", "uiAmountString", "amount"):
-            if key in value:
-                return safe_float(value.get(key))
-
-    for key in ("amount", "uiAmount"):
-        if key in transfer:
-            return safe_float(transfer.get(key))
-
-    return 0.0
+def token_ui_amount(balance: Dict[str, Any]) -> float:
+    ui = balance.get("uiTokenAmount") or {}
+    value = ui.get("uiAmountString")
+    if value is None:
+        value = ui.get("uiAmount")
+    return safe_float(value)
 
 
-def get_mint(transfer: Dict[str, Any]) -> Optional[str]:
-    value = transfer.get("mint") or transfer.get("tokenMint") or transfer.get("mintAddress")
-    return str(value) if value else None
+def account_key_string(key: Any) -> str:
+    if isinstance(key, str):
+        return key
+    if isinstance(key, dict):
+        return str(key.get("pubkey") or "")
+    return ""
 
 
-def get_from(transfer: Dict[str, Any]) -> Optional[str]:
-    value = transfer.get("fromUserAccount") or transfer.get("from") or transfer.get("sourceOwner")
-    return str(value) if value else None
-
-
-def get_to(transfer: Dict[str, Any]) -> Optional[str]:
-    value = transfer.get("toUserAccount") or transfer.get("to") or transfer.get("destinationOwner")
-    return str(value) if value else None
-
-
-def detect_buy_from_transfers(
-    event: Dict[str, Any],
+def detect_buy_from_rpc_transaction(
+    tx: Dict[str, Any],
     trader_wallet: str,
 ) -> Optional[Tuple[str, float]]:
-    token_transfers = event.get("tokenTransfers") or []
-    native_transfers = event.get("nativeTransfers") or []
+    meta = tx.get("meta")
+    transaction = tx.get("transaction")
+    if not isinstance(meta, dict) or not isinstance(transaction, dict):
+        return None
+    if meta.get("err") is not None:
+        return None
 
-    net_by_mint: Dict[str, float] = {}
-    quote_spent = False
+    message = transaction.get("message") or {}
+    keys = [account_key_string(k) for k in message.get("accountKeys") or []]
 
-    for transfer in token_transfers:
-        if not isinstance(transfer, dict):
-            continue
+    # Token-Deltas des Traders nach Mint
+    pre_by_mint: Dict[str, float] = {}
+    post_by_mint: Dict[str, float] = {}
 
-        mint = get_mint(transfer)
-        if not mint:
-            continue
+    for bal in meta.get("preTokenBalances") or []:
+        if isinstance(bal, dict) and bal.get("owner") == trader_wallet and bal.get("mint"):
+            mint = str(bal["mint"])
+            pre_by_mint[mint] = pre_by_mint.get(mint, 0.0) + token_ui_amount(bal)
 
-        amount = transfer_token_amount(transfer)
-        if amount <= 0:
-            continue
+    for bal in meta.get("postTokenBalances") or []:
+        if isinstance(bal, dict) and bal.get("owner") == trader_wallet and bal.get("mint"):
+            mint = str(bal["mint"])
+            post_by_mint[mint] = post_by_mint.get(mint, 0.0) + token_ui_amount(bal)
 
-        from_wallet = get_from(transfer)
-        to_wallet = get_to(transfer)
+    all_mints = set(pre_by_mint) | set(post_by_mint)
+    deltas = {
+        mint: post_by_mint.get(mint, 0.0) - pre_by_mint.get(mint, 0.0)
+        for mint in all_mints
+    }
 
-        if to_wallet == trader_wallet:
-            net_by_mint[mint] = net_by_mint.get(mint, 0.0) + amount
+    quote_spent = any(
+        deltas.get(mint, 0.0) < -1e-12
+        for mint in QUOTE_MINTS
+    )
 
-        if from_wallet == trader_wallet:
-            net_by_mint[mint] = net_by_mint.get(mint, 0.0) - amount
-            if mint in QUOTE_MINTS:
+    # Native SOL-Ausgabe bestimmen und Fee herausrechnen.
+    if trader_wallet in keys:
+        idx = keys.index(trader_wallet)
+        pre_bal = meta.get("preBalances") or []
+        post_bal = meta.get("postBalances") or []
+        if idx < len(pre_bal) and idx < len(post_bal):
+            spent_lamports = safe_float(pre_bal[idx]) - safe_float(post_bal[idx])
+            if idx == 0:
+                spent_lamports -= safe_float(meta.get("fee"))
+            sol_spent = max(0.0, spent_lamports / 1_000_000_000)
+            if sol_spent >= MIN_FAST_SOL_SPEND:
                 quote_spent = True
-
-    for transfer in native_transfers:
-        if isinstance(transfer, dict):
-            if get_from(transfer) == trader_wallet and safe_float(transfer.get("amount")) > 0:
-                quote_spent = True
-                break
 
     if not quote_spent:
         return None
 
     candidates = [
-        (mint, amount)
-        for mint, amount in net_by_mint.items()
-        if mint not in QUOTE_MINTS and amount > 0
+        (mint, delta)
+        for mint, delta in deltas.items()
+        if mint not in QUOTE_MINTS and delta > 1e-12
     ]
-
     if not candidates:
         return None
 
@@ -319,219 +323,13 @@ def detect_buy_from_transfers(
     return candidates[0]
 
 
-def detect_real_buy(
-    event: Dict[str, Any],
-    trader_wallet: str,
-) -> Optional[Tuple[str, float]]:
-    buy = detect_buy_from_swap_event(event, trader_wallet)
-    if buy:
-        return buy
-    return detect_buy_from_transfers(event, trader_wallet)
-
-
-async def fetch_market_data(mint: str) -> Optional[Dict[str, Any]]:
-    url = f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url, headers={"Accept": "application/json"})
-
-        if response.status_code != 200:
-            STATS["market_api_failures"] += 1
-            STATS["last_error"] = f"DexScreener HTTP {response.status_code}"
-            return None
-
-        data = response.json()
-        pairs = data.get("pairs") if isinstance(data, dict) else data if isinstance(data, list) else []
-
-        solana_pairs = [
-            pair for pair in (pairs or [])
-            if isinstance(pair, dict)
-            and str(pair.get("chainId", "")).lower() == "solana"
-        ]
-
-        if not solana_pairs:
-            return None
-
-        solana_pairs.sort(
-            key=lambda pair: safe_float((pair.get("liquidity") or {}).get("usd")),
-            reverse=True,
-        )
-
-        pair = solana_pairs[0]
-        txns_m5 = (pair.get("txns") or {}).get("m5") or {}
-
-        market_cap = safe_float(pair.get("marketCap"))
-        if market_cap <= 0:
-            market_cap = safe_float(pair.get("fdv"))
-
-        created_ms = safe_float(pair.get("pairCreatedAt"))
-        age_minutes = 0.0
-        if created_ms > 0:
-            age_minutes = max(0.0, (time.time() - created_ms / 1000) / 60)
-
-        base_token = pair.get("baseToken") or {}
-
-        return {
-            "name": base_token.get("name") or "Unbekannt",
-            "symbol": base_token.get("symbol") or "?",
-            "liquidity_usd": safe_float((pair.get("liquidity") or {}).get("usd")),
-            "volume_m5_usd": safe_float((pair.get("volume") or {}).get("m5")),
-            "buys_m5": int(safe_float(txns_m5.get("buys"))),
-            "sells_m5": int(safe_float(txns_m5.get("sells"))),
-            "price_change_m5": safe_float((pair.get("priceChange") or {}).get("m5")),
-            "market_cap_usd": market_cap,
-            "pair_age_minutes": age_minutes,
-            "dex": pair.get("dexId") or "?",
-        }
-
-    except Exception as exc:
-        STATS["market_api_failures"] += 1
-        STATS["last_error"] = f"DexScreener error: {str(exc)[:200]}"
-        return None
-
-
-def hard_filter(market: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
-    if not market:
-        return False, "Keine Marktdaten"
-
-    liquidity = market["liquidity_usd"]
-    volume = market["volume_m5_usd"]
-    buys = market["buys_m5"]
-    sells = market["sells_m5"]
-    ratio = buys / max(sells, 1)
-    mc = market["market_cap_usd"]
-    age_min = market["pair_age_minutes"]
-    change = market["price_change_m5"]
-
-    if liquidity < MIN_LIQUIDITY_USD:
-        return False, f"LiquiditÃ¤t zu niedrig (${liquidity:,.0f})"
-    if volume < MIN_VOLUME_M5_USD:
-        return False, f"5m-Volumen zu niedrig (${volume:,.0f})"
-    if buys < MIN_M5_BUYS:
-        return False, f"Zu wenige KÃ¤ufe ({buys})"
-    if ratio < MIN_BUY_SELL_RATIO:
-        return False, f"Buy/Sell zu schwach ({ratio:.2f}x)"
-    if mc <= 0:
-        return False, "Market Cap unbekannt"
-    if mc < MIN_MARKET_CAP_USD:
-        return False, f"Market Cap zu klein (${mc:,.0f})"
-    if mc > MAX_MARKET_CAP_USD:
-        return False, f"Market Cap zu groÃ (${mc:,.0f})"
-    if change > MAX_PRICE_CHANGE_M5:
-        return False, f"Schon zu stark gepumpt (+{change:.1f}% / 5m)"
-    if age_min > 0 and age_min < MIN_PAIR_AGE_MINUTES:
-        return False, f"Pair extrem neu ({age_min:.1f} Min.)"
-    if age_min > MAX_PAIR_AGE_HOURS * 60:
-        return False, f"Pair zu alt ({age_min/60:.1f} Std.)"
-    if liquidity > 0 and mc / liquidity > MAX_MC_TO_LIQ_RATIO:
-        return False, f"MarketCap/LiquiditÃ¤t zu hoch ({mc/liquidity:.1f}x)"
-
-    return True, "PASS"
-
-
-def calculate_score(market: Dict[str, Any]) -> Tuple[int, str]:
-    """
-    0-100 Opportunity Score.
-    One tracked strong trader is already the trigger.
-    Market structure decides whether the alert is good enough.
-    """
-    score = 30  # strong tracked trader signal
-
-    liquidity = market["liquidity_usd"]
-    volume = market["volume_m5_usd"]
-    buys = market["buys_m5"]
-    sells = market["sells_m5"]
-    ratio = buys / max(sells, 1)
-    change = market["price_change_m5"]
-    mc = market["market_cap_usd"]
-    age_min = market["pair_age_minutes"]
-
-    # Liquidity: max +18
-    if liquidity >= 150000:
-        score += 18
-    elif liquidity >= 80000:
-        score += 15
-    elif liquidity >= 50000:
-        score += 12
-    else:
-        score += 8
-
-    # 5m volume: max +14
-    if volume >= 100000:
-        score += 14
-    elif volume >= 50000:
-        score += 12
-    elif volume >= 25000:
-        score += 9
-    else:
-        score += 6
-
-    # Buy pressure: max +14
-    if ratio >= 3.0:
-        score += 14
-    elif ratio >= 2.0:
-        score += 11
-    elif ratio >= 1.5:
-        score += 8
-    else:
-        score += 5
-
-    # Momentum sweet spot: max +12
-    # We reward positive movement, but not a huge chase.
-    if 3 <= change <= 15:
-        score += 12
-    elif 1 <= change < 3:
-        score += 9
-    elif 15 < change <= 25:
-        score += 7
-    elif 25 < change <= MAX_PRICE_CHANGE_M5:
-        score += 3
-    elif change < 0:
-        score += 1
-
-    # Market cap: max +6
-    if 100000 <= mc <= 3000000:
-        score += 6
-    elif 60000 <= mc <= 6000000:
-        score += 4
-    else:
-        score += 2
-
-    # Pair age: max +6
-    if 5 <= age_min <= 360:
-        score += 6
-    elif 2 <= age_min < 5:
-        score += 4
-    elif 360 < age_min <= 1440:
-        score += 3
-    elif age_min == 0:
-        score += 2
-
-    score = min(score, 100)
-
-    if score >= 88:
-        grade = "ð¥ VERY STRONG"
-    elif score >= 80:
-        grade = "ð STRONG"
-    elif score >= MIN_SCORE:
-        grade = "â¡ EARLY GOOD"
-    else:
-        grade = "WATCH"
-
-    return score, grade
-
-
-async def send_instant_buy_alert(
+async def telegram_buy_alert(
     mint: str,
     trader_wallet: str,
+    signature: Optional[str],
+    source: str,
 ) -> bool:
-    """
-    V12 core behavior:
-    As soon as a real BUY by any tracked wallet is detected,
-    send Telegram immediately. No DexScreener request first.
-    """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_TARGET:
         STATS["last_error"] = "Telegram-Konfiguration fehlt."
         return False
 
@@ -541,19 +339,20 @@ async def send_instant_buy_alert(
         else trader_wallet
     )
 
+    speed_text = "â¡ FAST STREAM" if source == "WSS" else "ð¨ WEBHOOK"
     message = (
-        "ð¨ INSTANT BUY ALERT\n\n"
-        "ð¤ Einer deiner beobachteten Trader hat gerade gekauft.\n"
+        f"ð¨ TRADER BUY â {speed_text}\n\n"
+        "ð¤ Einer deiner beobachteten Trader hat gekauft.\n"
         f"ð Wallet: {short_wallet}\n\n"
         "ðª CONTRACT ADDRESS (CA):\n"
         f"{mint}\n\n"
-        "ð Unten auf âCA kopierenâ tippen und in Phantom prÃ¼fen.\n\n"
-        "â ï¸ Das ist eine KaufaktivitÃ¤ts-Meldung, keine Gewinnprognose. "
-        "CA, LiquiditÃ¤t, Preis und Slippage vor einem Kauf selbst prÃ¼fen."
+        "ð CA direkt unten kopieren.\n\n"
+        "â ï¸ On-Chain-Signal, keine Gewinnprognose. "
+        "Preis, LiquiditÃ¤t und Slippage vor einem eigenen Kauf prÃ¼fen."
     )
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+    payload: Dict[str, Any] = {
+        "chat_id": TELEGRAM_TARGET,
         "text": message,
         "disable_web_page_preview": True,
         "reply_markup": {
@@ -566,7 +365,7 @@ async def send_instant_buy_alert(
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         for attempt in range(2):
             try:
                 response = await client.post(url, json=payload)
@@ -576,122 +375,206 @@ async def send_instant_buy_alert(
 
             if response.status_code == 429:
                 STATS["telegram_rate_limits"] += 1
+                retry_after = 2
                 try:
                     retry_after = int(
                         response.json().get("parameters", {}).get("retry_after", 2)
                     )
                 except Exception:
-                    retry_after = 2
-
+                    pass
                 if attempt == 0:
                     await asyncio.sleep(min(max(retry_after, 1), 5))
                     continue
-
                 STATS["last_error"] = "Telegram 429 Too Many Requests"
                 return False
 
-            if response.is_error:
+            if response.status_code != 200:
                 STATS["last_error"] = (
                     f"Telegram HTTP {response.status_code}: {response.text[:200]}"
                 )
                 return False
 
+            STATS["signals_sent"] += 1
+            STATS["last_source"] = source
+            STATS["last_trader"] = trader_wallet
+            STATS["last_signature"] = signature
+            STATS["last_buy_mint"] = mint
             STATS["last_error"] = None
             return True
 
     return False
 
 
-async def send_telegram_signal(
-    mint: str,
-    market: Dict[str, Any],
-    score: int,
-    grade: str,
-) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        STATS["last_error"] = "Telegram-Konfiguration fehlt."
-        return False
+async def fetch_transaction_fast(signature: str) -> Optional[Dict[str, Any]]:
+    if not HELIUS_API_KEY:
+        return None
 
-    buys = market["buys_m5"]
-    sells = market["sells_m5"]
-    ratio = buys / max(sells, 1)
-    age_min = market["pair_age_minutes"]
-
-    age_text = (
-        f"{age_min:.0f} Min."
-        if age_min < 120
-        else f"{age_min/60:.1f} Std."
-    )
-
-    message = (
-        f"{grade} â {score}/100\n\n"
-        "ð¤ 1 starker beobachteter Trader hat gekauft\n"
-        "â Kein Warten auf einen zweiten Trader\n\n"
-        f"ðª {market['name']} ({market['symbol']})\n"
-        f"â± Pair-Alter: {age_text}\n"
-        f"ð§ LiquiditÃ¤t: ${market['liquidity_usd']:,.0f}\n"
-        f"ð¥ Volumen 5m: ${market['volume_m5_usd']:,.0f}\n"
-        f"ð¢ KÃ¤ufe 5m: {buys}\n"
-        f"ð´ VerkÃ¤ufe 5m: {sells}\n"
-        f"ð Buy/Sell: {ratio:.2f}x\n"
-        f"â¡ Kurs 5m: {market['price_change_m5']:+.1f}%\n"
-        f"ð° Market Cap: ${market['market_cap_usd']:,.0f}\n"
-        f"ð¦ DEX: {market['dex']}\n\n"
-        "ðª CONTRACT ADDRESS (CA):\n"
-        f"{mint}\n\n"
-        "â ï¸ Score ist nur ein Filter, keine Gewinnprognose. "
-        "CA, LiquiditÃ¤t und Slippage vor einem Kauf prÃ¼fen."
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-        "reply_markup": {
-            "inline_keyboard": [[{
-                "text": "ð CA kopieren",
-                "copy_text": {"text": mint},
-            }]]
-        },
+    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            },
+        ],
     }
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    # processed-Log kommt oft vor getTransaction(confirmed).
+    # Kurze Retries, damit wir trotzdem schneller als der normale Webhook sein kÃ¶nnen.
+    delays = [0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        for attempt in range(2):
+    async with httpx.AsyncClient(timeout=4) as client:
+        for delay in delays:
             try:
-                response = await client.post(url, json=payload)
-            except Exception as exc:
-                STATS["last_error"] = f"Telegram network error: {str(exc)[:200]}"
-                return False
+                response = await client.post(url, json=body)
+                if response.status_code == 200:
+                    data = response.json()
+                    result = data.get("result")
+                    if isinstance(result, dict):
+                        STATS["ws_transactions_fetched"] += 1
+                        return result
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
 
-            if response.status_code == 429:
-                STATS["telegram_rate_limits"] += 1
+    STATS["ws_fetch_misses"] += 1
+    return None
 
-                try:
-                    retry_after = int(
-                        response.json().get("parameters", {}).get("retry_after", 2)
+
+async def process_ws_signature(signature: str, trader_wallet: str) -> None:
+    if not claim_signature(signature):
+        return
+
+    tx = await fetch_transaction_fast(signature)
+    if not tx:
+        unclaim_signature(signature)
+        return
+
+    buy = detect_buy_from_rpc_transaction(tx, trader_wallet)
+    if not buy:
+        STATS["ignored_not_buy"] += 1
+        # Gelesen und kein Kauf: Signatur bleibt dedupliziert.
+        return
+
+    mint, _amount = buy
+    STATS["ws_buys"] += 1
+    await telegram_buy_alert(
+        mint=mint,
+        trader_wallet=trader_wallet,
+        signature=signature,
+        source="WSS",
+    )
+
+
+async def websocket_loop() -> None:
+    if not HELIUS_API_KEY or not TRACKED_WALLETS:
+        STATS["last_error"] = (
+            "FAST STREAM aus: HELIUS_API_KEY oder TRACKED_WALLETS fehlt."
+        )
+        return
+
+    url = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    backoff = 2
+
+    while True:
+        try:
+            async with websockets.connect(
+                url,
+                ping_interval=30,
+                ping_timeout=20,
+                close_timeout=5,
+                max_size=2_000_000,
+            ) as ws:
+                STATS["ws_connected"] = True
+                STATS["last_error"] = None
+                backoff = 2
+
+                request_to_wallet: Dict[int, str] = {}
+                subscription_to_wallet: Dict[int, str] = {}
+
+                request_id = 1000
+                for wallet in sorted(TRACKED_WALLETS):
+                    request_id += 1
+                    request_to_wallet[request_id] = wallet
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [wallet]},
+                            {"commitment": "processed"},
+                        ],
+                    }))
+
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    # Antwort auf Subscription
+                    if "id" in msg and "result" in msg and isinstance(msg.get("result"), int):
+                        req_id = msg.get("id")
+                        wallet = request_to_wallet.get(req_id)
+                        if wallet:
+                            subscription_to_wallet[int(msg["result"])] = wallet
+                        continue
+
+                    if msg.get("method") != "logsNotification":
+                        continue
+
+                    params = msg.get("params") or {}
+                    sub_id = params.get("subscription")
+                    result = params.get("result") or {}
+                    value = result.get("value") or {}
+
+                    if value.get("err") is not None:
+                        continue
+
+                    signature = value.get("signature")
+                    trader_wallet = subscription_to_wallet.get(sub_id)
+                    if not signature or not trader_wallet:
+                        continue
+
+                    STATS["ws_notifications"] += 1
+                    asyncio.create_task(
+                        process_ws_signature(str(signature), trader_wallet)
                     )
-                except Exception:
-                    retry_after = 2
 
-                if attempt == 0:
-                    await asyncio.sleep(min(max(retry_after, 1), 5))
-                    continue
+        except asyncio.CancelledError:
+            STATS["ws_connected"] = False
+            raise
+        except Exception as exc:
+            STATS["ws_connected"] = False
+            STATS["ws_reconnects"] += 1
+            STATS["last_error"] = f"WSS reconnect: {str(exc)[:200]}"
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
-                STATS["last_error"] = "Telegram 429 Too Many Requests"
-                return False
 
-            if response.is_error:
-                STATS["last_error"] = (
-                    f"Telegram HTTP {response.status_code}: {response.text[:200]}"
-                )
-                return False
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _ws_task
+    if HELIUS_API_KEY and TRACKED_WALLETS:
+        _ws_task = asyncio.create_task(websocket_loop())
+    yield
+    if _ws_task:
+        _ws_task.cancel()
+        try:
+            await _ws_task
+        except asyncio.CancelledError:
+            pass
 
-            STATS["last_error"] = None
-            return True
 
-    return False
+app = FastAPI(
+    title="Memecoin Trader Bot V14 Free Fast Stream",
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
@@ -699,10 +582,16 @@ async def health():
     return {
         "ok": True,
         "version": BUILD_VERSION,
-        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_TARGET),
+        "telegram_destination": (
+            "channel" if TELEGRAM_CHANNEL_ID
+            else "chat" if TELEGRAM_CHAT_ID
+            else "not_configured"
+        ),
         "tracked_wallets": len(TRACKED_WALLETS),
-        "mode": "INSTANT_BUY_ALERT",
-        "min_score": MIN_SCORE,
+        "mode": "FREE_FAST_WSS_PLUS_WEBHOOK",
+        "fast_stream_configured": bool(HELIUS_API_KEY),
+        "fast_stream_connected": bool(STATS["ws_connected"]),
     }
 
 
@@ -712,38 +601,25 @@ async def stats():
         "version": BUILD_VERSION,
         **STATS,
         "tracked_wallets": len(TRACKED_WALLETS),
-        "filters": {
-            "min_score": MIN_SCORE,
-            "min_liquidity_usd": MIN_LIQUIDITY_USD,
-            "min_volume_m5_usd": MIN_VOLUME_M5_USD,
-            "min_m5_buys": MIN_M5_BUYS,
-            "min_buy_sell_ratio": MIN_BUY_SELL_RATIO,
-            "min_market_cap_usd": MIN_MARKET_CAP_USD,
-            "max_market_cap_usd": MAX_MARKET_CAP_USD,
-            "max_price_change_m5": MAX_PRICE_CHANGE_M5,
-            "min_pair_age_minutes": MIN_PAIR_AGE_MINUTES,
-            "max_pair_age_hours": MAX_PAIR_AGE_HOURS,
-            "max_mc_to_liq_ratio": MAX_MC_TO_LIQ_RATIO,
-        },
+        "fast_stream_configured": bool(HELIUS_API_KEY),
     }
 
 
 @app.get("/test-telegram")
 async def test_telegram():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_TARGET:
         return {"ok": False, "error": "Telegram not configured"}
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": TELEGRAM_TARGET,
         "text": (
-            "â V12 INSTANT BUY ALERT ist aktiv.\n"
-            "ð¨ Jeder erkannte Kauf eines Ã¼berwachten Traders lÃ¶st sofort einen Alarm aus.\n"
-            "ð CA-Kopierbutton ist aktiv."
+            "â V14 FREE FAST STREAM ist aktiv.\n"
+            "â¡ Standard Helius WebSocket + bestehender SWAP-Webhook.\n"
+            "ð Kaufalarme enthalten weiterhin den CA-Kopierbutton."
         ),
     }
-
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(url, json=payload)
 
     return {
@@ -769,69 +645,42 @@ async def helius_webhook(request: Request):
 
         payload = await request.json()
         events = normalize_events(payload)
-        STATS["transactions_received"] += len(events)
-
-        cleanup_state()
-        alerts_sent = 0
+        STATS["webhook_transactions"] += len(events)
 
         for event in events:
             if not is_swap_event(event):
-                STATS["ignored_non_swap"] += 1
                 continue
-
-            STATS["swap_events_received"] += 1
 
             trader_wallet = find_tracked_wallet(event)
             if not trader_wallet:
                 continue
 
-            STATS["tracked_wallet_matches"] += 1
-            STATS["last_trader"] = trader_wallet
-
             signature = find_signature(event)
-            STATS["last_signature"] = signature
-
-            dedupe_key = signature or f"{trader_wallet}:{hash(str(event))}"
-            if dedupe_key in _seen_signatures:
+            if not claim_signature(signature):
                 continue
-            _seen_signatures[dedupe_key] = time.time()
 
-            buy = detect_real_buy(event, trader_wallet)
+            buy = detect_buy_from_enhanced_event(event, trader_wallet)
             if not buy:
                 STATS["ignored_not_buy"] += 1
                 continue
 
             mint, _amount = buy
-            STATS["real_buys_detected"] += 1
-            STATS["last_buy_mint"] = mint
-
-            # V12: INSTANT alert. No second trader, score or market filter can block it.
-            # We deliberately send before calling any external market-data API.
-            if mint in _alerted_mints:
-                continue
-
-            sent = await send_instant_buy_alert(
+            STATS["webhook_buys"] += 1
+            await telegram_buy_alert(
                 mint=mint,
                 trader_wallet=trader_wallet,
+                signature=signature,
+                source="WEBHOOK",
             )
 
-            if sent:
-                _alerted_mints[mint] = time.time()
-                STATS["signals_sent"] += 1
-                STATS["last_filter_reason"] = "INSTANT BUY ALERT SENT"
-                alerts_sent += 1
-
-        return {
-            "ok": True,
-            "version": BUILD_VERSION,
-            "alerts_sent": alerts_sent,
-        }
+        # Helius immer schnell mit 200 beantworten.
+        return {"ok": True, "version": BUILD_VERSION}
 
     except HTTPException:
         raise
-
     except Exception as exc:
         STATS["last_error"] = str(exc)[:500]
+        # Auch bei Parserfehler 200, damit keine Retry-Flut entsteht.
         return {
             "ok": False,
             "version": BUILD_VERSION,
